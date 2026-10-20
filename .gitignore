@@ -1,5 +1,6 @@
 # Runtime artifacts — never commit these
 test_keys/
+index.html
 *.db
 *.db-shm
 *.db-wal

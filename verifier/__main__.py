@@ -14,6 +14,8 @@ never import `harness` or `compliance_runtime`.
 from __future__ import annotations
 
 import argparse
+import datetime
+import html
 import shutil
 import sqlite3
 import sys
@@ -185,7 +187,274 @@ def main() -> int:
     overall = "VALID" if result["valid"] else "INVALID"
     print(f"  Overall: {overall}")
 
+    html_path = Path("index.html")
+    html_path.write_text(
+        _build_html(result, db_path=db_path, tamper_mode=args.tamper),
+        encoding="utf-8",
+    )
+    print(f"\n  Dashboard written to: {html_path.resolve()}")
+    print(f"  Open with: open {html_path.resolve()}")
+
     return 0 if result["valid"] else 1
+
+
+# ---------------------------------------------------------------------------
+# HTML dashboard generator (stdlib only — no external deps)
+# ---------------------------------------------------------------------------
+
+_BUCKET_LABELS: dict[str, str] = {
+    "deny":             "should_refuse",
+    "allow":            "should_act",
+    "require_approval": "should_escalate",
+    "allow_with_flag":  "should_flag",
+}
+
+_BUCKET_COLORS: dict[str, str] = {
+    "should_refuse":   "#ef4444",   # red
+    "should_act":      "#22c55e",   # green
+    "should_escalate": "#f59e0b",   # amber
+    "should_flag":     "#6366f1",   # indigo
+}
+
+_DISP_LABELS: dict[str, str] = {
+    "deny":             "deny",
+    "allow":            "allow",
+    "require_approval": "require_approval",
+    "allow_with_flag":  "allow_with_flag",
+}
+
+
+def _pct(v: float | None) -> str:
+    return f"{v * 100:.1f}%" if v is not None else "—"
+
+
+def _status_badge(ok: bool, label_pass: str = "PASS", label_fail: str = "FAIL") -> str:
+    cls = "badge-pass" if ok else "badge-fail"
+    text = label_pass if ok else label_fail
+    return f'<span class="{cls}">{text}</span>'
+
+
+def _build_receipt_rows(receipts: list[dict]) -> str:
+    rows = []
+    for r in receipts:
+        bucket = _BUCKET_LABELS.get(r["expected"], r["expected"])
+        color  = _BUCKET_COLORS.get(bucket, "#888")
+        ok     = r["expected"] == r["actual"]
+        mark   = "✓" if ok else "✗"
+        row_cls = "row-pass" if ok else "row-fail"
+        rows.append(
+            f'<tr class="{row_cls}">'
+            f'<td class="mono">{html.escape(r["test_id"])}</td>'
+            f'<td><span class="bucket-tag" style="background:{color}20;'
+            f'color:{color};border:1px solid {color}40">{html.escape(bucket)}</span></td>'
+            f'<td class="mono disp">{html.escape(r["expected"])}</td>'
+            f'<td class="mono disp">{html.escape(r["actual"])}</td>'
+            f'<td class="mark {"mark-pass" if ok else "mark-fail"}">{mark}</td>'
+            f'</tr>'
+        )
+    return "\n".join(rows)
+
+
+def _build_bucket_bars(stats: dict) -> str:
+    by_bucket = stats.get("by_bucket", {})
+    bars = []
+    order = ["deny", "allow", "require_approval", "allow_with_flag"]
+    for exp in order:
+        if exp not in by_bucket:
+            continue
+        bucket = _BUCKET_LABELS.get(exp, exp)
+        color  = _BUCKET_COLORS.get(bucket, "#888")
+        counts = by_bucket[exp]
+        total  = counts["total"]
+        correct = counts["correct"]
+        pct_w  = int(correct / total * 100) if total else 0
+        bars.append(
+            f'<div class="bar-row">'
+            f'  <div class="bar-label">{html.escape(bucket)}</div>'
+            f'  <div class="bar-track">'
+            f'    <div class="bar-fill" style="width:{pct_w}%;background:{color}"></div>'
+            f'  </div>'
+            f'  <div class="bar-count">{correct}/{total}</div>'
+            f'</div>'
+        )
+    return "\n".join(bars)
+
+
+def _build_html(result: dict, *, db_path: Path, tamper_mode: bool) -> str:
+    valid    = result["valid"]
+    chain_ok = result["chain_ok"]
+    sigs_ok  = result["sigs_ok"]
+    checked  = result["checked"]
+    errors   = result.get("errors", [])
+    receipts = result.get("receipts", [])
+    stats    = result.get("stats", {})
+
+    overall_color = "#16a34a" if valid else "#dc2626"
+    overall_text  = "VALID" if valid else "INVALID"
+    tamper_banner = (
+        '<div class="tamper-banner">⚠ TAMPER DEMO MODE — chain was modified before verification</div>'
+        if tamper_mode else ""
+    )
+    error_rows = "".join(
+        f'<li class="error-item"><code>{html.escape(e)}</code></li>' for e in errors
+    )
+    error_section = (
+        f'<div class="card errors-card"><h2>Chain errors</h2><ul>{error_rows}</ul></div>'
+        if errors else ""
+    )
+
+    accuracy  = stats.get("accuracy")
+    fo_rate   = stats.get("firing_offense_rate")
+    fr_rate   = stats.get("friction_rate")
+    acc_color = "#16a34a" if accuracy == 1.0 else "#dc2626"
+    fo_color  = "#16a34a" if fo_rate == 0.0  else "#dc2626"
+    fr_color  = "#16a34a" if fr_rate == 0.0  else "#dc2626"
+
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Chain Verifier</title>
+<style>
+  :root {{
+    --bg: #f8fafc; --card: #ffffff; --border: #e2e8f0;
+    --text: #0f172a; --muted: #64748b; --mono: #1e293b;
+    --pass: #16a34a; --fail: #dc2626;
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root:not([data-theme="light"]) {{
+      --bg:#0f172a;--card:#1e293b;--border:#334155;
+      --text:#f1f5f9;--muted:#94a3b8;--mono:#e2e8f0;
+    }}
+  }}
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: system-ui, sans-serif; background: var(--bg); color: var(--text);
+          line-height: 1.6; padding: 16px; }}
+  .page {{ max-width: 860px; margin: 0 auto; }}
+  h1 {{ font-size: 1.5rem; font-weight: 700; margin-bottom: 4px; }}
+  h2 {{ font-size: 1rem; font-weight: 600; margin-bottom: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }}
+  .meta {{ font-size: .85rem; color: var(--muted); margin-bottom: 24px; }}
+  .card {{ background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+           padding: 20px 24px; margin-bottom: 16px; }}
+  .overall-card {{ border-left: 5px solid {overall_color}; }}
+  .overall-status {{ font-size: 2rem; font-weight: 800; color: {overall_color}; }}
+  .badge-pass {{ display:inline-block;padding:2px 10px;border-radius:999px;font-size:.8rem;
+                 font-weight:700;background:#dcfce7;color:#15803d;border:1px solid #bbf7d0; }}
+  .badge-fail {{ display:inline-block;padding:2px 10px;border-radius:999px;font-size:.8rem;
+                 font-weight:700;background:#fee2e2;color:#b91c1c;border:1px solid #fecaca; }}
+  .integrity-grid {{ display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px; }}
+  .integrity-item {{ background:var(--bg);border:1px solid var(--border);border-radius:8px;
+                     padding:12px 16px; }}
+  .integrity-item .label {{ font-size:.8rem;color:var(--muted);margin-bottom:4px; }}
+  .stats-grid {{ display:grid;grid-template-columns:repeat(3,1fr);gap:12px; }}
+  @media(max-width:540px){{ .stats-grid,.integrity-grid{{grid-template-columns:1fr;}} }}
+  .stat-card {{ background:var(--bg);border:1px solid var(--border);border-radius:8px;
+                padding:16px;text-align:center; }}
+  .stat-value {{ font-size:1.8rem;font-weight:800;line-height:1; }}
+  .stat-label {{ font-size:.78rem;color:var(--muted);margin-top:4px; }}
+  .bar-row {{ display:flex;align-items:center;gap:10px;margin-bottom:10px; }}
+  .bar-label {{ width:160px;font-size:.82rem;color:var(--muted);flex-shrink:0; }}
+  .bar-track {{ flex:1;height:16px;background:var(--border);border-radius:999px;overflow:hidden; }}
+  .bar-fill {{ height:100%;border-radius:999px;transition:width .4s; }}
+  .bar-count {{ width:40px;text-align:right;font-size:.82rem;font-weight:600;color:var(--muted); }}
+  table {{ width:100%;border-collapse:collapse;font-size:.88rem; }}
+  th {{ text-align:left;padding:8px 10px;border-bottom:2px solid var(--border);
+        font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted); }}
+  td {{ padding:8px 10px;border-bottom:1px solid var(--border); }}
+  tr:last-child td {{ border-bottom:none; }}
+  .row-pass td {{ background:transparent; }}
+  .row-fail td {{ background:#fff1f2; }}
+  @media (prefers-color-scheme:dark) {{
+    :root:not([data-theme="light"]) .row-fail td {{ background:#2d1515; }}
+  }}
+  .mono {{ font-family: ui-monospace, monospace; }}
+  .disp {{ font-size:.82rem; }}
+  .mark {{ font-size:1rem;font-weight:700;text-align:center; }}
+  .mark-pass {{ color:var(--pass); }}
+  .mark-fail {{ color:var(--fail); }}
+  .bucket-tag {{ padding:2px 8px;border-radius:999px;font-size:.75rem;font-weight:600; }}
+  .errors-card {{ border-left:4px solid var(--fail); }}
+  .errors-card h2 {{ color:var(--fail); }}
+  .error-item {{ margin:4px 0 4px 16px;font-size:.82rem; }}
+  .tamper-banner {{ background:#fef3c7;border:1px solid #fde68a;color:#92400e;
+                    padding:10px 16px;border-radius:8px;margin-bottom:16px;font-weight:600; }}
+  @media (prefers-color-scheme:dark) {{
+    :root:not([data-theme="light"]) .tamper-banner {{
+      background:#2d1f00;border-color:#78350f;color:#fde68a;
+    }}
+  }}
+  .records-note {{ font-size:.8rem;color:var(--muted);margin-top:6px; }}
+</style>
+</head>
+<body>
+<div class="page">
+
+  {tamper_banner}
+
+  <div class="card overall-card">
+    <h1>Chain Verifier</h1>
+    <p class="meta">Generated {timestamp} &nbsp;·&nbsp; DB: <code>{html.escape(str(db_path))}</code>
+       &nbsp;·&nbsp; {checked} records</p>
+    <div class="overall-status">{overall_text}</div>
+    <div class="integrity-grid" style="margin-top:16px">
+      <div class="integrity-item">
+        <div class="label">Chain Integrity</div>
+        {_status_badge(chain_ok)}
+      </div>
+      <div class="integrity-item">
+        <div class="label">Signature Validity</div>
+        {_status_badge(sigs_ok)}
+      </div>
+    </div>
+  </div>
+
+  {error_section}
+
+  <div class="card">
+    <h2>Measurement stats</h2>
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-value" style="color:{acc_color}">{_pct(accuracy)}</div>
+        <div class="stat-label">Accuracy<br>({stats.get("correct","—")}/{stats.get("total","—")} correct)</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" style="color:{fo_color}">{_pct(fo_rate)}</div>
+        <div class="stat-label">Firing-offense rate<br>(target: 0.0%)</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" style="color:{fr_color}">{_pct(fr_rate)}</div>
+        <div class="stat-label">Friction rate<br>(target: 0.0%)</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Results by bucket</h2>
+    {_build_bucket_bars(stats)}
+  </div>
+
+  <div class="card">
+    <h2>Test cases ({len(receipts)})</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th><th>Bucket</th><th>Expected</th><th>Actual</th><th>Result</th>
+        </tr>
+      </thead>
+      <tbody>
+        {_build_receipt_rows(receipts)}
+      </tbody>
+    </table>
+    <p class="records-note">Chain contains {checked} total records
+      ({checked - len(receipts)} non-harness runtime records).</p>
+  </div>
+
+</div>
+</body>
+</html>"""
 
 
 if __name__ == "__main__":
